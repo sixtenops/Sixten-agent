@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""Report open loops from state/commitments.md.
+
+Usage: bin/loops [--days N] [--today YYYY-MM-DD] [--json]
+
+Groups open items into overdue / due within N days (default 3) / later / undated,
+split by whether Sixten owes it ("me") or someone else does.
+"""
+import argparse
+import json
+import re
+import sys
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+ROOT = Path(__file__).resolve().parent.parent
+LEDGER = ROOT / "state" / "commitments.md"
+PREFS = ROOT / "state" / "preferences.md"
+
+LINE = re.compile(
+    r"^- \[(?P<done>[ xX])\]\s*(?P<due>\d{4}-\d{2}-\d{2}|\?{4}-\?{2}-\?{2})\s*\|"
+    r"\s*(?P<owner>[^|]+?)\s*->\s*(?P<owed>[^|]+?)\s*\|"
+    r"\s*(?P<what>[^|]+?)\s*(?:\|\s*(?P<source>.*?))?\s*$"
+)
+
+
+def local_today():
+    m = re.search(r"\*\*Timezone:\*\*\s*([A-Za-z_]+/[A-Za-z_/+-]+)", PREFS.read_text()) if PREFS.exists() else None
+    if m:
+        try:
+            return datetime.now(ZoneInfo(m.group(1))).date()
+        except ZoneInfoNotFoundError:
+            pass
+    return date.today()
+
+
+def parse(text):
+    items, bad = [], []
+    section = None
+    for n, raw in enumerate(text.splitlines(), 1):
+        if raw.startswith("## "):
+            section = raw[3:].strip().lower()
+            continue
+        if section != "open" or not raw.startswith("- ["):
+            continue
+        m = LINE.match(raw.strip())
+        if not m:
+            bad.append((n, raw))
+            continue
+        d = m.groupdict()
+        if d["done"].strip():
+            continue
+        d["line"] = n
+        d["due"] = None if d["due"].startswith("?") else date.fromisoformat(d["due"])
+        d["mine"] = d["owner"].strip().lower() == "me"
+        items.append(d)
+    return items, bad
+
+
+def bucket(item, today, days):
+    if item["due"] is None:
+        return "undated"
+    if item["due"] < today:
+        return "overdue"
+    if item["due"] <= today + timedelta(days=days):
+        return "soon"
+    return "later"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--days", type=int, default=3)
+    ap.add_argument("--today", type=date.fromisoformat)
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    today = args.today or local_today()
+    items, bad = parse(LEDGER.read_text())
+    for it in items:
+        it["bucket"] = bucket(it, today, args.days)
+        it["days"] = (it["due"] - today).days if it["due"] else None
+
+    if args.json:
+        out = [{**it, "due": it["due"].isoformat() if it["due"] else None} for it in items]
+        json.dump({"today": today.isoformat(), "items": out, "malformed_lines": [n for n, _ in bad]}, sys.stdout, indent=2)
+        print()
+        return
+
+    titles = {"overdue": "OVERDUE", "soon": f"DUE IN ≤{args.days} DAYS", "undated": "NO DUE DATE", "later": "LATER"}
+    print(f"Open loops as of {today.isoformat()} ({len(items)} open)")
+    for key in ("overdue", "soon", "undated", "later"):
+        group = sorted((i for i in items if i["bucket"] == key), key=lambda i: (i["due"] or date.max))
+        if not group:
+            continue
+        print(f"\n{titles[key]}")
+        for side, label in ((True, "Sixten owes"), (False, "Owed to Sixten / others")):
+            rows = [i for i in group if i["mine"] == side]
+            if not rows:
+                continue
+            print(f"  {label}:")
+            for i in rows:
+                when = i["due"].isoformat() if i["due"] else "no date"
+                rel = "" if i["days"] is None else f" ({i['days']:+d}d)"
+                who = f"-> {i['owed']}" if side else f"{i['owner']} -> {i['owed']}"
+                print(f"    - {when}{rel}  {i['what']}  [{who}]  (line {i['line']})")
+    for n, raw in bad:
+        print(f"\nWARNING: line {n} in commitments.md doesn't match the format: {raw.strip()}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
